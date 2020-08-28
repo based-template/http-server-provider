@@ -1,4 +1,4 @@
-// Copyright 2015-2019 Capital One Services, LLC
+// Copyright 2015-2020 Capital One Services, LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,29 +25,35 @@ use actix_web::dev::Server;
 use actix_web::http::StatusCode;
 use actix_web::web::Bytes;
 use actix_web::{middleware, web, App, HttpRequest, HttpResponse, HttpServer};
-use codec::capabilities::{CapabilityProvider, Dispatcher, NullDispatcher};
-use codec::core::CapabilityConfiguration;
-use futures::future::Future;
+use codec::capabilities::{
+    CapabilityDescriptor, CapabilityProvider, Dispatcher, NullDispatcher, OperationDirection,
+    OP_GET_CAPABILITY_DESCRIPTOR,
+};
+use codec::{core::CapabilityConfiguration, http::OP_HANDLE_REQUEST};
 use std::collections::HashMap;
-use std::error::Error as StdError;
+use std::error::Error;
 use std::sync::Arc;
 use std::sync::RwLock;
-use wascc_codec::core::OP_CONFIGURE;
-use wascc_codec::core::OP_REMOVE_ACTOR;
+use wascc_codec::core::{OP_BIND_ACTOR, OP_REMOVE_ACTOR};
 use wascc_codec::{deserialize, serialize};
 
-/// Unique identifier for the capability being provided. Note other providers can
-/// provide this same capability (just not at the same time)
 const CAPABILITY_ID: &str = "wascc:http_server";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const REVISION: u32 = 2; // Increment for each crates publish
 
+#[cfg(not(feature = "static_plugin"))]
 capability_provider!(HttpServerProvider, HttpServerProvider::new);
 
+/// An Actix-web implementation of the `wascc:http_server` capability specification
 pub struct HttpServerProvider {
     dispatcher: Arc<RwLock<Box<dyn Dispatcher>>>,
     servers: Arc<RwLock<HashMap<String, Server>>>,
 }
 
 impl HttpServerProvider {
+    /// Creates a new HTTP server provider. This is automatically invoked
+    /// by dynamically loaded plugins, and manually invoked by custom hosts
+    /// with a statically-linked dependency on this crate.
     pub fn new() -> Self {
         Self::default()
     }
@@ -64,10 +70,7 @@ impl HttpServerProvider {
                 return;
             }
             let server = lock.get(module).unwrap();
-            let _ = server
-                .stop(true)
-                .wait()
-                .map(|_| info!("Stopped Actix Web Server"));
+            let _ = server.stop(true);
         }
         {
             let mut lock = self.servers.write().unwrap();
@@ -101,12 +104,30 @@ impl HttpServerProvider {
             .bind(bind_addr)
             .unwrap()
             .disable_signals()
-            .start();
+            .run();
 
             servers.write().unwrap().insert(module_id.clone(), server);
 
             let _ = sys.run();
         });
+    }
+
+    /// Obtains the capability provider descriptor
+    fn get_descriptor(&self) -> Result<Vec<u8>, Box<dyn Error>> {
+        Ok(serialize(
+            CapabilityDescriptor::builder()
+                .id(CAPABILITY_ID)
+                .name("Default waSCC HTTP Server Provider (Actix)")
+                .long_description("A fast, multi-threaded HTTP server for waSCC actors")
+                .version(VERSION)
+                .revision(REVISION)
+                .with_operation(
+                    OP_HANDLE_REQUEST,
+                    OperationDirection::ToActor,
+                    "Delivers an HTTP request to an actor and expects an HTTP response in return",
+                )
+                .build(),
+        )?)
     }
 }
 
@@ -114,7 +135,7 @@ impl Default for HttpServerProvider {
     fn default() -> Self {
         match env_logger::try_init() {
             Ok(_) => {}
-            Err(_) => println!("** HTTP provider: Logger already initialized, skipping."),
+            Err(_) => {}
         };
         HttpServerProvider {
             dispatcher: Arc::new(RwLock::new(Box::new(NullDispatcher::new()))),
@@ -124,11 +145,8 @@ impl Default for HttpServerProvider {
 }
 
 impl CapabilityProvider for HttpServerProvider {
-    fn capability_id(&self) -> &'static str {
-        CAPABILITY_ID
-    }
-
-    fn configure_dispatch(&self, dispatcher: Box<dyn Dispatcher>) -> Result<(), Box<dyn StdError>> {
+    /// Accepts the dispatcher provided by the waSCC host runtime
+    fn configure_dispatch(&self, dispatcher: Box<dyn Dispatcher>) -> Result<(), Box<dyn Error>> {
         info!("Dispatcher configured.");
 
         let mut lock = self.dispatcher.write().unwrap();
@@ -137,35 +155,28 @@ impl CapabilityProvider for HttpServerProvider {
         Ok(())
     }
 
-    fn name(&self) -> &'static str {
-        "waSCC Default HTTP Server (Actix Web)"
-    }
+    /// Handles an invocation from the host runtime
+    fn handle_call(&self, actor: &str, op: &str, msg: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+        trace!("Handling operation `{}` from `{}`", op, actor);
 
-    fn handle_call(
-        &self,
-        origin: &str,
-        op: &str,
-        msg: &[u8],
-    ) -> Result<Vec<u8>, Box<dyn StdError>> {
-        info!("Handling operation `{}` from `{}`", op, origin);
-        // TIP: do not allow individual modules to attempt to send configuration,
-        // only accept it from the host runtime
-        if op == OP_CONFIGURE && origin == "system" {
-            let cfgvals = deserialize(msg)?;
-            self.spawn_server(&cfgvals);
-            Ok(vec![])
-        } else if op == OP_REMOVE_ACTOR && origin == "system" {
-            let cfgvals = deserialize::<CapabilityConfiguration>(msg)?;
-            info!("Removing actor configuration for {}", cfgvals.module);
-            self.terminate_server(&cfgvals.module);
-            Ok(vec![])
-        } else {
-            Err(format!("Unknown operation: {}", op).into())
+        match op {
+            OP_BIND_ACTOR if actor == "system" => {
+                self.spawn_server(&deserialize(msg)?);
+                Ok(vec![])
+            }
+            OP_REMOVE_ACTOR if actor == "system" => {
+                let cfgvals = deserialize::<CapabilityConfiguration>(msg)?;
+                info!("Removing actor configuration for {}", cfgvals.module);
+                self.terminate_server(&cfgvals.module);
+                Ok(vec![])
+            }
+            OP_GET_CAPABILITY_DESCRIPTOR if actor == "system" => self.get_descriptor(),
+            _ => Err("bad dispatch".into()),
         }
     }
 }
 
-fn request_handler(
+async fn request_handler(
     req: HttpRequest,
     payload: Bytes,
     state: web::Data<Arc<RwLock<Box<dyn Dispatcher>>>>,
@@ -182,7 +193,7 @@ fn request_handler(
 
     let resp = {
         let lock = (*state).read().unwrap();
-        lock.dispatch(&format!("{}!HandleRequest", module.get_ref()), &buf)
+        lock.dispatch(module.get_ref(), OP_HANDLE_REQUEST, &buf)
     };
     match resp {
         Ok(r) => {
